@@ -1225,7 +1225,8 @@ defmodule Ash.Changeset do
          {:atomic, condition} <-
            atomic_condition(where, changeset, context),
          {{:atomic, modified_changeset?, new_changeset, atomic_changes, validations,
-           create_atomics}, condition} <-
+           create_atomics},
+          condition} <-
            {atomic_with_changeset(
               module.atomic(changeset, change_opts, struct(Ash.Resource.Change.Context, context)),
               changeset
@@ -1422,6 +1423,7 @@ defmodule Ash.Changeset do
       | create_atomics: Keyword.put(changeset.create_atomics, key, value),
         no_atomic_constraints: [key | changeset.no_atomic_constraints]
     }
+    |> add_pending_allow_nil_create_atomic(key)
   end
 
   defp apply_atomic_create(changeset, key, value) do
@@ -1449,6 +1451,7 @@ defmodule Ash.Changeset do
           changeset
           | create_atomics: Keyword.put(changeset.create_atomics, attribute.name, value)
         }
+        |> add_pending_allow_nil_create_atomic(attribute.name)
 
       {:not_atomic, message} ->
         {:not_atomic,
@@ -2521,6 +2524,7 @@ defmodule Ash.Changeset do
       | create_atomics: Keyword.put(changeset.create_atomics, key, value),
         no_atomic_constraints: [key | changeset.no_atomic_constraints]
     }
+    |> add_pending_allow_nil_create_atomic(key)
   end
 
   def atomic_set(changeset, key, value, opts) do
@@ -2669,10 +2673,13 @@ defmodule Ash.Changeset do
                 set_error_field(value, attribute.name)
               end
 
-            %{
-              changeset
-              | create_atomics: Keyword.put(changeset.create_atomics, attribute.name, value)
-            }
+            changeset
+            |> Map.put(
+              :create_atomics,
+              Keyword.put(changeset.create_atomics, attribute.name, value)
+            )
+            |> add_pending_allow_nil_create_atomic(attribute.name)
+            |> clear_required_attribute_error(attribute.name)
 
           {:ok, value} ->
             allow_nil? =
@@ -2685,11 +2692,13 @@ defmodule Ash.Changeset do
             if is_nil(value) and !allow_nil? do
               add_required_attribute_error(changeset, attribute)
             else
-              %{
-                changeset
-                | attributes: Map.put(changeset.attributes, attribute.name, value),
-                  create_atomics: Keyword.delete(changeset.create_atomics, attribute.name)
-              }
+              changeset
+              |> Map.put(:attributes, Map.put(changeset.attributes, attribute.name, value))
+              |> Map.put(
+                :create_atomics,
+                Keyword.delete(changeset.create_atomics, attribute.name)
+              )
+              |> clear_required_attribute_error(attribute.name)
               |> store_casted_attribute(attribute.name, value, true)
             end
 
@@ -2719,46 +2728,14 @@ defmodule Ash.Changeset do
 
   @doc false
   def handle_allow_nil_atomics(changeset, actor) do
-    changeset.atomics
-    |> Enum.reduce(changeset, fn {key, value}, changeset ->
-      attribute = Ash.Resource.Info.attribute(changeset.resource, key)
-
-      if attribute.primary_key? do
+    changeset
+    |> handle_allow_nil_atomic_entries(changeset.atomics, :atomics)
+    |> then(fn changeset ->
+      if changeset.action.type == :create do
         changeset
+        |> handle_allow_nil_atomic_entries(changeset.create_atomics, :create_atomics)
       else
-        allow_nil? =
-          attribute.allow_nil? and attribute.name not in changeset.action.require_attributes
-
-        if allow_nil? || not Ash.Expr.can_return_nil?(value) do
-          value
-        else
-          if Ash.DataLayer.data_layer_can?(changeset.resource, :expr_error) do
-            expr(
-              if is_nil(type(^value, ^attribute.type, ^attribute.constraints)) do
-                error(
-                  ^Ash.Error.Changes.Required,
-                  %{
-                    field: ^attribute.name,
-                    type: ^:attribute,
-                    resource: ^changeset.resource
-                  }
-                )
-              else
-                ^value
-              end
-            )
-          else
-            {:not_atomic,
-             "Failed to validate expression #{inspect(value)}: data layer `#{Ash.DataLayer.data_layer(changeset.resource)}` does not support the expr_error"}
-          end
-        end
-        |> case do
-          {:not_atomic, error} ->
-            Ash.Changeset.add_error(changeset, error)
-
-          value ->
-            %{changeset | atomics: Keyword.put(changeset.atomics, key, value)}
-        end
+        changeset
       end
     end)
     |> Ash.Changeset.hydrate_atomic_refs(actor, eager?: true)
@@ -2779,6 +2756,104 @@ defmodule Ash.Changeset do
         end
     end)
   end
+
+  defp handle_allow_nil_atomic_entries(changeset, entries, target_field)
+       when target_field in [:atomics, :create_atomics] do
+    Enum.reduce(entries, changeset, fn {key, value}, changeset ->
+      apply_allow_nil_atomic_entry(changeset, key, value, target_field)
+    end)
+  end
+
+  @doc false
+  def finalize_allow_nil_create_atomics(changeset, actor) do
+    keys =
+      changeset.context[:private][:pending_allow_nil_create_atomics]
+      |> List.wrap()
+      |> Enum.uniq()
+
+    keys
+    |> Enum.reduce(changeset, fn key, changeset ->
+      case Keyword.fetch(changeset.create_atomics, key) do
+        {:ok, value} ->
+          apply_allow_nil_atomic_entry(changeset, key, value, :create_atomics)
+
+        :error ->
+          changeset
+      end
+    end)
+    |> Ash.Changeset.hydrate_atomic_refs(actor, eager?: true)
+    |> clear_pending_allow_nil_create_atomics()
+  end
+
+  defp apply_allow_nil_atomic_entry(changeset, key, value, target_field)
+       when target_field in [:atomics, :create_atomics] do
+    attribute = Ash.Resource.Info.attribute(changeset.resource, key)
+
+    if attribute.primary_key? do
+      changeset
+    else
+      allow_nil? =
+        attribute.allow_nil? and attribute.name not in changeset.action.require_attributes
+
+      if allow_nil? || not Ash.Expr.can_return_nil?(value) do
+        value
+      else
+        if Ash.DataLayer.data_layer_can?(changeset.resource, :expr_error) do
+          expr(
+            if is_nil(type(^value, ^attribute.type, ^attribute.constraints)) do
+              error(
+                ^Ash.Error.Changes.Required,
+                %{
+                  field: ^attribute.name,
+                  type: ^:attribute,
+                  resource: ^changeset.resource
+                }
+              )
+            else
+              ^value
+            end
+          )
+        else
+          {:not_atomic,
+           "Failed to validate expression #{inspect(value)}: data layer `#{Ash.DataLayer.data_layer(changeset.resource)}` does not support the expr_error"}
+        end
+      end
+      |> case do
+        {:not_atomic, error} ->
+          Ash.Changeset.add_error(changeset, error)
+
+        value ->
+          case target_field do
+            :atomics ->
+              %{changeset | atomics: Keyword.put(changeset.atomics, key, value)}
+
+            :create_atomics ->
+              %{changeset | create_atomics: Keyword.put(changeset.create_atomics, key, value)}
+          end
+      end
+    end
+  end
+
+  defp add_pending_allow_nil_create_atomic(changeset, key) do
+    context =
+      update_in(changeset.context, [:private, :pending_allow_nil_create_atomics], fn
+        nil ->
+          [key]
+
+        keys ->
+          [key | keys]
+      end)
+
+    %{changeset | context: context}
+  end
+
+  defp clear_pending_allow_nil_create_atomics(%{context: %{private: private}} = changeset)
+       when is_map(private) do
+    private = Map.delete(private, :pending_allow_nil_create_atomics)
+    %{changeset | context: %{changeset.context | private: private}}
+  end
+
+  defp clear_pending_allow_nil_create_atomics(changeset), do: changeset
 
   @doc """
   Set the result of the action. This will prevent running the underlying datalayer behavior
@@ -4361,27 +4436,23 @@ defmodule Ash.Changeset do
       end
     end)
     |> Enum.reduce(changeset, fn required_attribute, changeset ->
-      if changing_attribute?(changeset, required_attribute.name) do
-        if is_nil(get_attribute(changeset, required_attribute.name)) do
-          if required_attribute.name in changeset.invalid_keys do
-            changeset
-          else
-            add_required_attribute_error(changeset, required_attribute)
-          end
-        else
+      cond do
+        Keyword.has_key?(changeset.create_atomics, required_attribute.name) ->
           changeset
-        end
-      else
-        if is_nil(required_attribute.default) ||
-             required_attribute.name in changeset.action.require_attributes do
-          if required_attribute.name in changeset.invalid_keys do
-            changeset
-          else
-            add_required_attribute_error(changeset, required_attribute)
-          end
-        else
+
+        changing_attribute?(changeset, required_attribute.name) and
+            is_nil(get_attribute(changeset, required_attribute.name)) ->
+          maybe_add_required_attribute_error(changeset, required_attribute)
+
+        changing_attribute?(changeset, required_attribute.name) ->
           changeset
-        end
+
+        is_nil(required_attribute.default) ||
+            required_attribute.name in changeset.action.require_attributes ->
+          maybe_add_required_attribute_error(changeset, required_attribute)
+
+        true ->
+          changeset
       end
     end)
   end
@@ -4429,6 +4500,33 @@ defmodule Ash.Changeset do
   end
 
   def require_values(changeset, _, _, _), do: changeset
+
+  defp maybe_add_required_attribute_error(changeset, required_attribute) do
+    if required_attribute.name in changeset.invalid_keys do
+      changeset
+    else
+      add_required_attribute_error(changeset, required_attribute)
+    end
+  end
+
+  defp clear_required_attribute_error(
+         %{action_type: :create, __validated_for_action__: action} = changeset,
+         attribute_name
+       )
+       when not is_nil(action) do
+    errors =
+      Enum.reject(changeset.errors, fn
+        %Ash.Error.Changes.Required{field: field, type: :attribute} ->
+          field == attribute_name
+
+        _ ->
+          false
+      end)
+
+    %{changeset | errors: errors, valid?: errors == []}
+  end
+
+  defp clear_required_attribute_error(changeset, _attribute_name), do: changeset
 
   defp add_required_attribute_error(changeset, required_attribute) do
     changeset.resource
@@ -6294,7 +6392,8 @@ defmodule Ash.Changeset do
   @spec changing_attribute?(t(), atom) :: boolean
   def changing_attribute?(changeset, attribute) do
     Map.has_key?(changeset.attributes, attribute) ||
-      Keyword.has_key?(changeset.atomics, attribute)
+      Keyword.has_key?(changeset.atomics, attribute) ||
+      Keyword.has_key?(changeset.create_atomics, attribute)
   end
 
   @doc "Returns true if a relationship exists in the changes"

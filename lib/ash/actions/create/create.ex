@@ -356,10 +356,9 @@ defmodule Ash.Actions.Create do
                   if changeset.context[:private][:action_result] do
                     changeset
                   else
-                    Ash.Changeset.require_values(
-                      changeset,
-                      :create
-                    )
+                    changeset
+                    |> Ash.Changeset.finalize_allow_nil_create_atomics(opts[:actor])
+                    |> Ash.Changeset.require_values(:create)
                     |> Ash.Changeset.require_values(
                       :update,
                       false,

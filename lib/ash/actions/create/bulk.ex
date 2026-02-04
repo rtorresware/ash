@@ -516,10 +516,9 @@ defmodule Ash.Actions.Create.Bulk do
     {batch, must_be_simple_results} =
       batch
       |> Enum.map(fn changeset ->
-        Ash.Changeset.require_values(
-          changeset,
-          :create
-        )
+        changeset
+        |> Ash.Changeset.finalize_allow_nil_create_atomics(opts[:actor])
+        |> Ash.Changeset.require_values(:create)
         |> Ash.Changeset.require_values(
           :update,
           false,
@@ -1084,8 +1083,9 @@ defmodule Ash.Actions.Create.Bulk do
            {changeset, %{notifications: new_notifications}} <-
              Ash.Changeset.run_before_actions(changeset),
            %{valid?: true} = changeset <-
-             Ash.Changeset.require_values(
-               changeset,
+             changeset
+             |> Ash.Changeset.finalize_allow_nil_create_atomics(opts[:actor])
+             |> Ash.Changeset.require_values(
                :create,
                true,
                attrs_to_require
